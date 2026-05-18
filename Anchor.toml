@@ -1,0 +1,27 @@
+[toolchain]
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.devnet]
+doorcash = "67g5HhrzQ2eqqEDJTEogHGBjAfwRD8evD3wg6LTDV8GK"
+
+[programs.localnet]
+doorcash = "67g5HhrzQ2eqqEDJTEogHGBjAfwRD8evD3wg6LTDV8GK"
+
+[programs.mainnet]
+doorcash = "67g5HhrzQ2eqqEDJTEogHGBjAfwRD8evD3wg6LTDV8GK"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "mainnet"
+wallet = "./doorcash_server.json"
+
+[workspace]
+members = ["program"]
+
+[scripts]
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
