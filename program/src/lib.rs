@@ -6,6 +6,8 @@ declare_id!("67g5HhrzQ2eqqEDJTEogHGBjAfwRD8evD3wg6LTDV8GK");
 
 pub const HOUSE_EDGE_BPS: u64 = 1_000;
 pub const BASIS_POINTS: u64 = 10_000;
+pub const NO_WINNER_REFUND_BPS: u64 = 5_000;
+pub const NO_WINNER_SPECTATOR_BPS: u64 = 1_000;
 pub const MAX_WINNERS: usize = 111;
 pub const MAX_GAME_ID_LEN: usize = 64;
 pub const EMERGENCY_RECOVERY_DELAY_SLOTS: u64 = 216_000;
@@ -65,6 +67,11 @@ pub mod doorcash {
         game.refund_pool = 0;
         game.refund_per_entry = 0;
         game.refund_round_id = 0;
+        game.spectator_count = 0;
+        game.spectator_pool = 0;
+        game.spectator_payout_each = 0;
+        game.spectator_paid_count = 0;
+        game.spectator_paid_total = 0;
         game.streak_id = mode_state.active_streak_id;
         game.mode = mode;
         game.settlement_kind = SettlementKind::Unsettled;
@@ -406,6 +413,62 @@ pub mod doorcash {
         Ok(())
     }
 
+    pub fn register_game_spectator(
+        ctx: Context<RegisterGameSpectator>,
+        _game_id: String,
+    ) -> Result<()> {
+        let game = &mut ctx.accounts.game;
+        let mode_state = &ctx.accounts.mode_state;
+
+        require!(
+            matches!(game.status, GameStatus::Active),
+            DoorCashError::InvalidGameStatus
+        );
+        require!(
+            !mode_state.refund_round_open,
+            DoorCashError::ModeRefundRoundOpen
+        );
+        require!(mode_state.mode == game.mode, DoorCashError::ModeMismatch);
+
+        let (expected_entry, _) = Pubkey::find_program_address(
+            &[
+                b"entry",
+                game.game_id.as_bytes(),
+                ctx.accounts.spectator_wallet.key.as_ref(),
+            ],
+            ctx.program_id,
+        );
+        require!(
+            ctx.accounts.player_entry.key() == expected_entry,
+            DoorCashError::InvalidPlayerEntry
+        );
+        require!(
+            ctx.accounts.player_entry.lamports() == 0,
+            DoorCashError::SpectatorIsPlayer
+        );
+
+        let spectator = &mut ctx.accounts.game_spectator;
+        spectator.wallet = ctx.accounts.spectator_wallet.key();
+        spectator.game_id = game.game_id.clone();
+        spectator.registered_at_slot = Clock::get()?.slot;
+        spectator.refund_round_id = 0;
+        spectator.payout_lamports = 0;
+        spectator.paid = false;
+
+        game.spectator_count = game
+            .spectator_count
+            .checked_add(1)
+            .ok_or(DoorCashError::ArithmeticOverflow)?;
+
+        emit!(GameSpectatorRegistered {
+            game_id: game.game_id.clone(),
+            spectator: spectator.wallet,
+            spectator_count: game.spectator_count,
+        });
+
+        Ok(())
+    }
+
     pub fn open_no_winner_settlement(ctx: Context<OpenNoWinnerSettlement>) -> Result<()> {
         let game = &mut ctx.accounts.game;
         let mode_state = &mut ctx.accounts.mode_state;
@@ -468,10 +531,23 @@ pub mod doorcash {
             .checked_add(ante_after_house)
             .ok_or(DoorCashError::ArithmeticOverflow)?;
         let refund_pool = distributable
-            .checked_div(2)
+            .checked_mul(NO_WINNER_REFUND_BPS)
+            .ok_or(DoorCashError::ArithmeticOverflow)?
+            .checked_div(BASIS_POINTS)
             .ok_or(DoorCashError::ArithmeticOverflow)?;
+        let spectator_pool_base = if game.spectator_count > 0 {
+            distributable
+                .checked_mul(NO_WINNER_SPECTATOR_BPS)
+                .ok_or(DoorCashError::ArithmeticOverflow)?
+                .checked_div(BASIS_POINTS)
+                .ok_or(DoorCashError::ArithmeticOverflow)?
+        } else {
+            0
+        };
         let carry_out_base = distributable
             .checked_sub(refund_pool)
+            .ok_or(DoorCashError::ArithmeticOverflow)?
+            .checked_sub(spectator_pool_base)
             .ok_or(DoorCashError::ArithmeticOverflow)?;
 
         let refund_per_entry = refund_pool
@@ -483,8 +559,23 @@ pub mod doorcash {
         let refund_remainder = refund_pool
             .checked_sub(paid_total)
             .ok_or(DoorCashError::ArithmeticOverflow)?;
+        let spectator_payout_each = if game.spectator_count > 0 {
+            spectator_pool_base
+                .checked_div(game.spectator_count)
+                .ok_or(DoorCashError::ArithmeticOverflow)?
+        } else {
+            0
+        };
+        let spectator_paid_total = spectator_payout_each
+            .checked_mul(game.spectator_count)
+            .ok_or(DoorCashError::ArithmeticOverflow)?;
+        let spectator_remainder = spectator_pool_base
+            .checked_sub(spectator_paid_total)
+            .ok_or(DoorCashError::ArithmeticOverflow)?;
         let carry_out = carry_out_base
             .checked_add(refund_remainder)
+            .ok_or(DoorCashError::ArithmeticOverflow)?
+            .checked_add(spectator_remainder)
             .ok_or(DoorCashError::ArithmeticOverflow)?;
 
         mode_state.carry_lamports = carry_out;
@@ -503,6 +594,10 @@ pub mod doorcash {
         game.refund_pool = refund_pool;
         game.refund_per_entry = refund_per_entry;
         game.refund_round_id = mode_state.open_refund_round_id;
+        game.spectator_pool = spectator_paid_total;
+        game.spectator_payout_each = spectator_payout_each;
+        game.spectator_paid_count = 0;
+        game.spectator_paid_total = 0;
         game.prize_each = 0;
         game.settlement_kind = SettlementKind::NoWinner;
         game.status = GameStatus::Settling;
@@ -516,6 +611,9 @@ pub mod doorcash {
             carry_out,
             refund_per_entry,
             eligible_entry_count: mode_state.eligible_entry_count,
+            spectator_count: game.spectator_count,
+            spectator_pool: spectator_paid_total,
+            spectator_payout_each,
         });
 
         Ok(())
@@ -586,6 +684,78 @@ pub mod doorcash {
                 .checked_add(participant.eligible_entries)
                 .ok_or(DoorCashError::ArithmeticOverflow)?;
             participant.exit(ctx.program_id)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn pay_spectator_batch<'info>(
+        ctx: Context<'_, '_, 'info, 'info, PaySpectatorBatch<'info>>,
+        refund_round_id: u64,
+    ) -> Result<()> {
+        let game = &mut ctx.accounts.game;
+        let mode_state = &ctx.accounts.mode_state;
+
+        require!(
+            matches!(game.status, GameStatus::Settling),
+            DoorCashError::InvalidGameStatus
+        );
+        require!(mode_state.mode == game.mode, DoorCashError::ModeMismatch);
+        require!(
+            mode_state.refund_round_open,
+            DoorCashError::RefundRoundNotOpen
+        );
+        require!(
+            mode_state.open_refund_round_id == refund_round_id
+                && game.refund_round_id == refund_round_id,
+            DoorCashError::RefundRoundMismatch
+        );
+        require!(
+            ctx.remaining_accounts.len() % 2 == 0,
+            DoorCashError::BatchAccountMismatch
+        );
+
+        for chunk in ctx.remaining_accounts.chunks(2) {
+            let spectator_info = &chunk[0];
+            let wallet_info = &chunk[1];
+
+            let mut spectator: Account<GameSpectator> = Account::try_from(spectator_info)?;
+            require!(
+                spectator.game_id == game.game_id,
+                DoorCashError::SpectatorGameMismatch
+            );
+            require!(
+                spectator.wallet == wallet_info.key(),
+                DoorCashError::Unauthorized
+            );
+
+            if spectator.paid && spectator.refund_round_id == refund_round_id {
+                continue;
+            }
+            require!(!spectator.paid, DoorCashError::SpectatorAlreadyPaid);
+
+            let amount = game.spectator_payout_each;
+            if amount > 0 {
+                transfer_mode_vault(
+                    game.mode,
+                    &ctx.accounts.mode_vault.to_account_info(),
+                    wallet_info,
+                    amount,
+                )?;
+            }
+
+            spectator.refund_round_id = refund_round_id;
+            spectator.payout_lamports = amount;
+            spectator.paid = true;
+            game.spectator_paid_count = game
+                .spectator_paid_count
+                .checked_add(1)
+                .ok_or(DoorCashError::ArithmeticOverflow)?;
+            game.spectator_paid_total = game
+                .spectator_paid_total
+                .checked_add(amount)
+                .ok_or(DoorCashError::ArithmeticOverflow)?;
+            spectator.exit(ctx.program_id)?;
         }
 
         Ok(())
@@ -700,6 +870,10 @@ pub mod doorcash {
         require!(
             mode_state.refund_paid_entry_count >= mode_state.eligible_entry_count,
             DoorCashError::RefundRoundIncomplete
+        );
+        require!(
+            game.spectator_paid_count >= game.spectator_count,
+            DoorCashError::SpectatorRoundIncomplete
         );
 
         mode_state.refund_round_open = false;
@@ -921,6 +1095,11 @@ pub struct Game {
     pub refund_pool: u64,
     pub refund_per_entry: u64,
     pub refund_round_id: u64,
+    pub spectator_count: u64,
+    pub spectator_pool: u64,
+    pub spectator_payout_each: u64,
+    pub spectator_paid_count: u64,
+    pub spectator_paid_total: u64,
     pub streak_id: u64,
     pub settlement_kind: SettlementKind,
     pub vault_bump: u8,
@@ -962,6 +1141,18 @@ pub struct ModeParticipant {
     pub streak_id: u64,
     pub eligible_entries: u64,
     pub last_paid_refund_round_id: u64,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct GameSpectator {
+    pub wallet: Pubkey,
+    #[max_len(MAX_GAME_ID_LEN)]
+    pub game_id: String,
+    pub registered_at_slot: u64,
+    pub refund_round_id: u64,
+    pub payout_lamports: u64,
+    pub paid: bool,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, InitSpace)]
@@ -1100,6 +1291,35 @@ pub struct RegisterNoWinnerEntries<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(game_id: String)]
+pub struct RegisterGameSpectator<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"game", game_id.as_bytes()],
+        bump,
+        has_one = authority @ DoorCashError::Unauthorized
+    )]
+    pub game: Account<'info, Game>,
+    #[account(mut, seeds = [b"mode", game.mode.to_le_bytes().as_ref()], bump)]
+    pub mode_state: Account<'info, ModeState>,
+    /// CHECK: spectator wallet recipient, validated by GameSpectator PDA seeds
+    pub spectator_wallet: AccountInfo<'info>,
+    /// CHECK: expected PlayerEntry PDA; must not exist for spectators
+    pub player_entry: AccountInfo<'info>,
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + GameSpectator::INIT_SPACE,
+        seeds = [b"spectator", game_id.as_bytes(), spectator_wallet.key().as_ref()],
+        bump
+    )]
+    pub game_spectator: Account<'info, GameSpectator>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct OpenNoWinnerSettlement<'info> {
     pub authority: Signer<'info>,
     #[account(mut, has_one = authority @ DoorCashError::Unauthorized, has_one = house_wallet @ DoorCashError::HouseWalletMismatch)]
@@ -1120,6 +1340,19 @@ pub struct OpenNoWinnerSettlement<'info> {
 
 #[derive(Accounts)]
 pub struct PayNoWinnerBatch<'info> {
+    pub authority: Signer<'info>,
+    #[account(mut, has_one = authority @ DoorCashError::Unauthorized)]
+    pub game: Account<'info, Game>,
+    #[account(mut, seeds = [b"mode", game.mode.to_le_bytes().as_ref()], bump)]
+    pub mode_state: Account<'info, ModeState>,
+    #[account(mut, seeds = [b"mode-vault", game.mode.to_le_bytes().as_ref()], bump)]
+    /// CHECK: mode rollover/refund vault PDA
+    pub mode_vault: AccountInfo<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct PaySpectatorBatch<'info> {
     pub authority: Signer<'info>,
     #[account(mut, has_one = authority @ DoorCashError::Unauthorized)]
     pub game: Account<'info, Game>,
@@ -1251,6 +1484,9 @@ pub struct NoWinnerSettlementOpened {
     pub carry_out: u64,
     pub refund_per_entry: u64,
     pub eligible_entry_count: u64,
+    pub spectator_count: u64,
+    pub spectator_pool: u64,
+    pub spectator_payout_each: u64,
 }
 
 #[event]
@@ -1265,6 +1501,13 @@ pub struct NoWinnerEntriesRepaired {
     pub game_id: String,
     pub refund_round_id: u64,
     pub repaired_entries: u64,
+}
+
+#[event]
+pub struct GameSpectatorRegistered {
+    pub game_id: String,
+    pub spectator: Pubkey,
+    pub spectator_count: u64,
 }
 
 #[event]
@@ -1351,6 +1594,16 @@ pub enum DoorCashError {
     InsufficientVaultFunds,
     #[msg("Emergency recovery delay has not elapsed")]
     EmergencyRecoveryTooEarly,
+    #[msg("Player entry account does not match the spectator wallet")]
+    InvalidPlayerEntry,
+    #[msg("A paid player cannot receive the spectator payout for the same game")]
+    SpectatorIsPlayer,
+    #[msg("Spectator account does not belong to this game")]
+    SpectatorGameMismatch,
+    #[msg("Spectator has already been paid for this refund round")]
+    SpectatorAlreadyPaid,
+    #[msg("Spectator payout round has not paid all eligible spectators yet")]
+    SpectatorRoundIncomplete,
 }
 
 fn is_valid_mode(mode: u8) -> bool {
