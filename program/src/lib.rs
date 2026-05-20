@@ -1025,12 +1025,10 @@ pub struct InitializeGame<'info> {
 pub struct EnterGame<'info> {
     #[account(mut)]
     pub player: Signer<'info>,
-    pub authority: Signer<'info>,
     #[account(
         mut,
         seeds = [b"game", game_id.as_bytes()],
-        bump,
-        has_one = authority @ DoorCashError::Unauthorized
+        bump
     )]
     pub game: Account<'info, Game>,
     /// CHECK: vault receives SOL
